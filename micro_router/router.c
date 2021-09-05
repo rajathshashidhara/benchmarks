@@ -274,6 +274,49 @@ static inline void pktmbuf_free_bulk(struct rte_mbuf *mbs[], unsigned int cnt)
   }
 }
 
+static void process_packets(int queue)
+{
+  unsigned num, i, ret, cnt_fwd, cnt_drop;
+  struct rte_mbuf *mbs[BATCH_SIZE], *mbs_fwd[BATCH_SIZE], *mbs_drop[BATCH_SIZE];
+  struct eth_hdr *eh;
+
+  num = rte_eth_rx_burst(port_id, queue, mbs, BATCH_SIZE);
+  cnt_fwd = cnt_drop = 0;
+
+  stat_rx += num;
+
+  for (i = 0; i < num; i++) {
+    eh = rte_pktmbuf_mtod(mbs[i], struct eth_hdr *);
+    if (f_beui16(eh->type) == ETH_TYPE_IP) {
+      ret = handle_rx_ip(mbs[i]);
+    } else if (f_beui16(eh->type) == ETH_TYPE_ARP) {
+      ret = handle_rx_arp(mbs[i]);
+    } else {
+      ret = 1;
+    }
+
+    if (ret) {
+      mbs_drop[cnt_drop++] = mbs[i];
+    }
+    else {
+      mbs_fwd[cnt_fwd++] = mbs[i];
+    }
+  }
+
+  if (cnt_fwd) {
+
+    ret = rte_eth_tx_burst(port_id, queue, mbs_fwd, cnt_fwd);
+    for (i = ret; i < cnt_fwd; i++) {
+      mbs_drop[cnt_drop++] = mbs_fwd[i];
+      stat_tail_drops++;
+    }
+  }
+
+  if (cnt_drop) {
+    pktmbuf_free_bulk(mbs_drop, cnt_drop);
+  }
+}
+
 static void receive_packets(int queue)
 {
   unsigned num, i, ret, cnt_fwd, cnt_drop;
@@ -361,6 +404,24 @@ static int run_thread(void *arg)
     while (1) {
       transmit_packets(worker_id);
     }
+  }
+
+  return 0;
+}
+
+static int worker_thread(void *arg)
+{
+  int lcore_id, worker_id;
+  lcore_id = rte_lcore_id();
+
+  // lcore_id is 1-indexed
+  lcore_id -= 1;
+  assert(lcore_id >= 0 && lcore_id < num_workers);
+
+  worker_id = lcore_id;
+  while (1)
+  {
+    process_packets(worker_id);
   }
 
   return 0;
@@ -465,7 +526,7 @@ static int parse_args(int argc, char *argv[], size_t *pqlen_total)
 int main(int argc, char *argv[])
 {
   int n;
-  unsigned threads = 2 * num_workers, core, i;
+  unsigned threads = num_workers, core, i;
   size_t qlen_total;
   struct rte_mempool *pool;
 
@@ -506,7 +567,7 @@ int main(int argc, char *argv[])
   i = 0;
   RTE_LCORE_FOREACH_SLAVE(core) {
     if (i++ < threads) {
-      if (rte_eal_remote_launch(run_thread, NULL, core) != 0) {
+      if (rte_eal_remote_launch(worker_thread, NULL, core) != 0) {
         return -1;
       }
     }
