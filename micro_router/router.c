@@ -43,7 +43,7 @@
 #include <utils.h>
 #include <packet_defs.h>
 
-#define BUFFER_SIZE 1500
+#define BUFFER_SIZE 2048
 #define PERTHREAD_MBUFS 2048
 #define RING_SIZE       (4 * PERTHREAD_MBUFS)
 #define MBUF_SIZE (BUFFER_SIZE + sizeof(struct rte_mbuf) + RTE_PKTMBUF_HEADROOM)
@@ -63,6 +63,7 @@ static int network_tx_thread_init(unsigned queue);
 static struct rte_mempool *mempool_alloc(size_t count);
 
 static const uint8_t port_id = 0;
+
 static const struct rte_eth_conf port_conf = {
     .rxmode = {
       .mq_mode = ETH_MQ_RX_RSS,
@@ -72,7 +73,7 @@ static const struct rte_eth_conf port_conf = {
     },
     .rx_adv_conf = {
       .rss_conf = {
-        .rss_hf = ETH_RSS_TCP,
+        .rss_hf = ETH_RSS_NONFRAG_IPV4_TCP,
       },
     }
   };
@@ -83,6 +84,8 @@ static struct rte_ether_addr eth_addr;
 static size_t queues_num;
 static struct queue *queues;
 
+static uint64_t stat_rx = 0;
+static uint64_t stat_tx = 0;
 static uint64_t stat_tail_drops = 0;
 static uint64_t stat_rnd_drops = 0;
 
@@ -264,6 +267,8 @@ static void receive_packets()
   num = rte_eth_rx_burst(port_id, 0, mbs, BATCH_SIZE);
   cnt_fwd = cnt_drop = 0;
 
+  stat_rx += num;
+
   for (i = 0; i < num; i++) {
     eh = rte_pktmbuf_mtod(mbs[i], struct eth_hdr *);
     if (f_beui16(eh->type) == ETH_TYPE_IP) {
@@ -306,6 +311,7 @@ static void transmit_packets()
   if (num > 0) {
     tx = rte_eth_tx_burst(port_id, 0, mbs, num);
 
+    stat_tx += tx;
     for (drop = 0; (tx + drop) < num; drop++) {
       mbs_free[drop] = mbs[tx + drop];
       stat_tail_drops++;
@@ -317,8 +323,8 @@ static void transmit_packets()
   }
 }
 
-#define RX_THREAD 0
-#define TX_THREAD 1
+#define RX_THREAD 1
+#define TX_THREAD 2
 static int run_thread(void *arg)
 {
   unsigned lcore_id;
@@ -490,8 +496,8 @@ int main(int argc, char *argv[])
   fflush(stdout);
 
   while (1) {
-    printf("tail_drops=%"PRIu64" rnd_drops=%"PRIu64"  ",
-        stat_tail_drops, stat_rnd_drops);
+    printf("rx=%"PRIu64" tx=%"PRIu64" tail_drops=%"PRIu64" rnd_drops=%"PRIu64"  ",
+        stat_rx, stat_tx, stat_tail_drops, stat_rnd_drops);
     printf("\n");
     fflush(stdout);
     sleep(1);
