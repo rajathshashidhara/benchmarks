@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <assert.h>
 
 #include <rte_config.h>
 #include <rte_memcpy.h>
@@ -58,11 +59,14 @@ struct queue {
 };
 
 static int network_init(unsigned num_rx, unsigned num_tx);
-static int network_rx_thread_init(unsigned queue, struct rte_mempool *pool);
+static int network_rx_thread_init(unsigned queue);
 static int network_tx_thread_init(unsigned queue);
 static struct rte_mempool *mempool_alloc(size_t count);
 
+#define MAX_WORKERS 32
 static const uint8_t port_id = 0;
+static const uint8_t num_workers = 2;
+static int init_done = 0;
 
 static const struct rte_eth_conf port_conf = {
     .rxmode = {
@@ -79,10 +83,12 @@ static const struct rte_eth_conf port_conf = {
   };
 
 static struct rte_eth_dev_info eth_devinfo;
-static struct rte_ring *rx_to_tx;
 static struct rte_ether_addr eth_addr;
 static size_t queues_num;
 static struct queue *queues;
+
+struct rte_mempool *pool[MAX_WORKERS];
+struct rte_ring *rx_to_tx[MAX_WORKERS];
 
 static uint64_t stat_rx = 0;
 static uint64_t stat_tx = 0;
@@ -115,19 +121,23 @@ static int network_init(unsigned num_rx, unsigned num_tx)
 
   /* get mac address and device info */
   rte_eth_macaddr_get(port_id, &eth_addr);
-  // rte_eth_dev_info_get(port_id, &eth_devinfo);
-  // eth_devinfo.default_txconf.txq_flags = ETH_TXQ_FLAGS_NOVLANOFFL;
 
   return 0;
 }
 
-static int network_rx_thread_init(unsigned queue, struct rte_mempool *pool)
+static int network_rx_thread_init(unsigned queue)
 {
   int ret;
 
+  /* allocate pool */
+  if ((pool[queue] = mempool_alloc(PERTHREAD_MBUFS)) == NULL) {
+    fprintf(stderr, "mempool_alloc failed\n");
+    return -1;
+  }
+
   /* initialize queue */
   ret = rte_eth_rx_queue_setup(port_id, queue, RX_DESCRIPTORS,
-          rte_socket_id(), &eth_devinfo.default_rxconf, pool);
+          rte_socket_id(), &eth_devinfo.default_rxconf, pool[queue]);
   if (ret != 0) {
     return -1;
   }
@@ -138,12 +148,19 @@ static int network_rx_thread_init(unsigned queue, struct rte_mempool *pool)
 static int network_tx_thread_init(unsigned queue)
 {
   int ret;
+  char ring_name[256];
 
   /* initialize queue */
   ret = rte_eth_tx_queue_setup(port_id, queue, TX_DESCRIPTORS,
           rte_socket_id(), &eth_devinfo.default_txconf);
   if (ret != 0) {
     fprintf(stderr, "network_tx_thread_init: rte_eth_tx_queue_setup failed\n");
+    return -1;
+  }
+
+  snprintf(ring_name, 256, "rx_to_tx-%u", queue);
+  rx_to_tx[queue] = rte_ring_create(ring_name, PERTHREAD_MBUFS, rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
+  if (rx_to_tx[queue] == NULL) {
     return -1;
   }
 
@@ -258,13 +275,13 @@ static inline void pktmbuf_free_bulk(struct rte_mbuf *mbs[], unsigned int cnt)
   }
 }
 
-static void receive_packets()
+static void receive_packets(int queue)
 {
   unsigned num, i, ret, cnt_fwd, cnt_drop;
   struct rte_mbuf *mbs[BATCH_SIZE], *mbs_fwd[BATCH_SIZE], *mbs_drop[BATCH_SIZE];
   struct eth_hdr *eh;
 
-  num = rte_eth_rx_burst(port_id, 0, mbs, BATCH_SIZE);
+  num = rte_eth_rx_burst(port_id, queue, mbs, BATCH_SIZE);
   cnt_fwd = cnt_drop = 0;
 
   stat_rx += num;
@@ -289,7 +306,7 @@ static void receive_packets()
 
   if (cnt_fwd) {
 
-    ret = rte_ring_sp_enqueue_burst(rx_to_tx, mbs_fwd, cnt_fwd, NULL);
+    ret = rte_ring_sp_enqueue_burst(rx_to_tx[queue], mbs_fwd, cnt_fwd, NULL);
     for (i = ret; i < cnt_fwd; i++) {
       mbs_drop[cnt_drop++] = mbs_fwd[i];
       stat_tail_drops++;
@@ -301,15 +318,15 @@ static void receive_packets()
   }
 }
 
-static void transmit_packets()
+static void transmit_packets(int queue)
 {
   struct rte_mbuf *mbs[BATCH_SIZE], *mbs_free[BATCH_SIZE];
   size_t num = 0, drop, tx;
 
-  num = rte_ring_sc_dequeue_burst(rx_to_tx, mbs, BATCH_SIZE, NULL);
+  num = rte_ring_sc_dequeue_burst(rx_to_tx[queue], mbs, BATCH_SIZE, NULL);
 
   if (num > 0) {
-    tx = rte_eth_tx_burst(port_id, 0, mbs, num);
+    tx = rte_eth_tx_burst(port_id, queue, mbs, num);
 
     stat_tx += tx;
     for (drop = 0; (tx + drop) < num; drop++) {
@@ -327,17 +344,32 @@ static void transmit_packets()
 #define TX_THREAD 2
 static int run_thread(void *arg)
 {
-  unsigned lcore_id;
+  int lcore_id, worker_id;
   lcore_id = rte_lcore_id();
 
-  if (lcore_id == RX_THREAD) {
+  // lcore_id is 1-indexed
+  lcore_id -= 1;
+  assert(lcore_id >= 0 && lcore_id < (2 * num_workers));
+
+  if (lcore_id >= num_workers)
+    return 0;
+
+  // RX thread
+  worker_id = lcore_id / 2;
+  if (lcore_id % 2 == 0) {
+    network_rx_thread_init(worker_id);
+    __sync_add_and_fetch(&init_done, 1);
+
     while (1) {
-      receive_packets();
+      receive_packets(worker_id);
     }
   }
-  else if (lcore_id == TX_THREAD) {
+  else {
+    network_tx_thread_init(worker_id);
+    __sync_add_and_fetch(&init_done, 1);
+
     while (1) {
-      transmit_packets();
+      transmit_packets(worker_id);
     }
   }
 
@@ -443,9 +475,11 @@ static int parse_args(int argc, char *argv[], size_t *pqlen_total)
 int main(int argc, char *argv[])
 {
   int n;
-  unsigned threads = 2, core, i;
+  unsigned threads = 2 * num_workers, core, i;
   size_t qlen_total;
   struct rte_mempool *pool;
+
+  assert(num_workers <= MAX_WORKERS);
 
   if ((n = rte_eal_init(argc, argv)) < 0) {
     return -1;
@@ -462,23 +496,8 @@ int main(int argc, char *argv[])
   }
 
   /* initialize networking */
-  if (network_init(1, 1) != 0) {
+  if (network_init(num_workers, num_workers) != 0) {
     fprintf(stderr, "network_init failed\n");
-    return -1;
-  }
-
-  /* initialize queues */
-  network_rx_thread_init(0, pool);
-  network_tx_thread_init(0);
-
-  rx_to_tx = rte_ring_create("rx_to_tx", PERTHREAD_MBUFS, rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
-  if (rx_to_tx == NULL) {
-    return -1;
-  }
-
-  /* start device */
-  if (rte_eth_dev_start(port_id) != 0) {
-    fprintf(stderr, "rte_eth_dev_start failed\n");
     return -1;
   }
 
@@ -491,6 +510,9 @@ int main(int argc, char *argv[])
       }
     }
   }
+
+  __sync_add_and_fetch(&init_done, 1);
+  while (init_done < threads);
 
   printf("router ready\n");
   fflush(stdout);
