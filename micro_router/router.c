@@ -66,7 +66,6 @@ static struct rte_mempool *mempool_alloc(size_t count);
 #define MAX_WORKERS 32
 static const uint8_t port_id = 0;
 static const uint8_t num_workers = 1;
-static int init_done = 0;
 
 static const struct rte_eth_conf port_conf = {
     .rxmode = {
@@ -354,17 +353,11 @@ static int run_thread(void *arg)
   // RX thread
   worker_id = lcore_id / 2;
   if (lcore_id % 2 == 0) {
-    network_rx_thread_init(worker_id);
-    __sync_add_and_fetch(&init_done, 1);
-
     while (1) {
       receive_packets(worker_id);
     }
   }
   else {
-    network_tx_thread_init(worker_id);
-    __sync_add_and_fetch(&init_done, 1);
-
     while (1) {
       transmit_packets(worker_id);
     }
@@ -498,6 +491,17 @@ int main(int argc, char *argv[])
     return -1;
   }
 
+  for (i = 0; i < num_workers; i++){
+    network_rx_thread_init(i);
+    network_tx_thread_init(i);
+  }
+
+  /* start device */
+  if (rte_eth_dev_start(port_id) != 0) {
+    fprintf(stderr, "rte_eth_dev_start failed\n");
+    return -1;
+  }
+
   /* start threads */
   i = 0;
   RTE_LCORE_FOREACH_SLAVE(core) {
@@ -506,14 +510,6 @@ int main(int argc, char *argv[])
         return -1;
       }
     }
-  }
-
-  while (init_done < threads);
-
-  /* start device */
-  if (rte_eth_dev_start(port_id) != 0) {
-    fprintf(stderr, "rte_eth_dev_start failed\n");
-    return -1;
   }
 
   printf("router ready\n");
